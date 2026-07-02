@@ -94,6 +94,7 @@ compile_dylib() {
     rm -f "$SRC_FILE"
     cat > "$SRC_FILE" << 'HOOK_SOURCE'
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
@@ -102,7 +103,13 @@ compile_dylib() {
 #import <stdint.h>
 #import <string.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <sys/stat.h>
+#import <signal.h>
+#import <setjmp.h>
+#import <mach/mach_vm.h>
+#import <objc/runtime.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 static FILE *g_logFile = NULL;
 
@@ -119,11 +126,508 @@ static const char    *kDylibSuffix_Resources  = "Resources/wechat.dylib";
 static const char    *kDylibSuffix_Frameworks = "Frameworks/wechat.dylib";
 static const int32_t  kRevokeType    = 0x2712;   // isRevokeMessage 比较的 MsgType 常量
 
+// ── 内容缓存环缓冲（dylib 侧缓存，供撤回反查）──
+#define CONTENT_RING_SIZE 200
+static struct {
+    uint64_t svrid;
+    uint64_t content_ptr;    // 原始内容指针（NSString* 或 char*，in-process 可读）
+    uint64_t from_wrapper;   // CMessageWrap+0x08
+    time_t   saved_at;
+} g_content_ring[CONTENT_RING_SIZE];
+static volatile int32_t g_ring_head = 0;  // 原子递增
+
+// ── 最近表情 XML 缓存（用于导出原始 GIF/WebP/APNG）──
+static char g_last_emoji_xml[4096] = {0};
+static char g_last_emoji_md5[96] = {0};
+static time_t g_last_emoji_at = 0;
+static CFTimeInterval g_wciSuppressSaveAlertUntil = 0;
+static CFTimeInterval g_wciLastAutoExportAt = 0;
+
+
+// ── 撤回 XML 重写（方案B：新建 XML，突破原 CDATA 长度限制）──
+// 微信在 isRevokeMessage 返回后还会读取 msg+0x130/0x138 指向的 XML，
+// 因此不能用栈内存。这里使用 malloc 交给后续微信对象生命周期处理；
+// 若微信不接管释放，单次撤回最多泄漏约 4KB，优先保证聊天窗口提示稳定。
+#define REVOKE_XML_MAX_BYTES 4096
+#define REVOKE_NOTICE_MAX_CHARS 180
+
+static _Bool xml_find_tag_span(const char *xml, const char *tag,
+                               const char **out_value_start,
+                               const char **out_value_end) {
+    char open_tag[64];
+    char close_tag[64];
+    snprintf(open_tag, sizeof(open_tag), "<%s>", tag);
+    snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
+
+    const char *start = strstr(xml, open_tag);
+    if (!start) return 0;
+    start += strlen(open_tag);
+    const char *end = strstr(start, close_tag);
+    if (!end || end < start) return 0;
+    *out_value_start = start;
+    *out_value_end = end;
+    return 1;
+}
+
+static _Bool xml_find_cdata_span(const char *xml,
+                                 const char **out_value_start,
+                                 const char **out_value_end) {
+    const char *start = strstr(xml, "<![CDATA[");
+    if (!start) return 0;
+    start += 9;
+    const char *end = strstr(start, "]]>");
+    if (!end || end < start) return 0;
+    *out_value_start = start;
+    *out_value_end = end;
+    return 1;
+}
+
+static void copy_span(char *out, size_t out_sz, const char *start, const char *end) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!start || !end || end <= start) return;
+    size_t len = (size_t)(end - start);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+}
+
+static void xml_unescape_basic_inplace(char *s) {
+    if (!s) return;
+    char *r = s, *w = s;
+    while (*r) {
+        if (strncmp(r, "&amp;", 5) == 0) { *w++ = '&'; r += 5; }
+        else if (strncmp(r, "&quot;", 6) == 0) { *w++ = '"'; r += 6; }
+        else if (strncmp(r, "&apos;", 6) == 0) { *w++ = '\''; r += 6; }
+        else if (strncmp(r, "&lt;", 4) == 0) { *w++ = '<'; r += 4; }
+        else if (strncmp(r, "&gt;", 4) == 0) { *w++ = '>'; r += 4; }
+        else { *w++ = *r++; }
+    }
+    *w = '\0';
+}
+
+static _Bool xml_find_attr_value(const char *xml, const char *attr, char *out, size_t out_sz) {
+    if (!xml || !attr || !out || out_sz == 0) return 0;
+    out[0] = '\0';
+    char pat[80];
+    snprintf(pat, sizeof(pat), "%s=", attr);
+    const char *p = strstr(xml, pat);
+    if (!p) {
+        snprintf(pat, sizeof(pat), "%s =", attr);
+        p = strstr(xml, pat);
+    }
+    if (!p) return 0;
+    p = strchr(p, '=');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    char quote = 0;
+    if (*p == '"' || *p == '\'') quote = *p++;
+    const char *e = NULL;
+    if (quote) e = strchr(p, quote);
+    else {
+        e = p;
+        while (*e && *e != ' ' && *e != '\t' && *e != '/' && *e != '>') e++;
+    }
+    if (!e || e <= p) return 0;
+    size_t n = (size_t)(e - p);
+    if (n >= out_sz) n = out_sz - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    xml_unescape_basic_inplace(out);
+    return out[0] != '\0';
+}
+
+static void remember_emoji_xml_if_any(const char *content) {
+    if (!content || !strstr(content, "<emoji")) return;
+    size_t n = strlen(content);
+    if (n >= sizeof(g_last_emoji_xml)) n = sizeof(g_last_emoji_xml) - 1;
+    memcpy(g_last_emoji_xml, content, n);
+    g_last_emoji_xml[n] = '\0';
+    g_last_emoji_at = time(NULL);
+    char md5[96] = {0};
+    if (xml_find_attr_value(g_last_emoji_xml, "md5", md5, sizeof(md5)) ||
+        xml_find_attr_value(g_last_emoji_xml, "md5forencrypt", md5, sizeof(md5))) {
+        strncpy(g_last_emoji_md5, md5, sizeof(g_last_emoji_md5) - 1);
+    }
+    ARLOG("emoji xml cached: md5=%s len=%zu", g_last_emoji_md5, n);
+
+    FILE *f = fopen("/tmp/wechat_emoji_xml_cache.tsv", "a");
+    if (f) {
+        char safe[4096];
+        size_t j = 0;
+        for (size_t i = 0; g_last_emoji_xml[i] && j < sizeof(safe) - 1; i++) {
+            char c = g_last_emoji_xml[i];
+            safe[j++] = (c == '\t' || c == '\n' || c == '\r') ? ' ' : c;
+        }
+        safe[j] = '\0';
+        fprintf(f, "%lld\t%s\t%s\n", (long long)g_last_emoji_at, g_last_emoji_md5, safe);
+        fclose(f);
+    }
+}
+
+static void extract_revoke_display_name(const char *notify_text, const char *fallback,
+                                        char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+
+    if (notify_text && notify_text[0]) {
+        const char *patterns[] = {
+            "撤回了",                  // 中文："张三" 撤回了一条消息
+            " recalled a message",    // 英文："Alice" recalled a message
+            " recalled",              // 英文兜底
+            NULL,
+        };
+        const char *cut = NULL;
+        for (int i = 0; patterns[i]; i++) {
+            const char *p = strstr(notify_text, patterns[i]);
+            if (p && p > notify_text && (!cut || p < cut)) cut = p;
+        }
+
+        if (cut && cut > notify_text) {
+            const char *start = notify_text;
+            size_t nlen = (size_t)(cut - notify_text);
+            while (nlen > 0 && start[nlen - 1] == ' ') nlen--;
+            while (nlen > 0 && *start == ' ') { start++; nlen--; }
+            // 常见 CDATA 会带英文双引号："ai" recalled a message
+            if (nlen >= 2 && start[0] == '"' && start[nlen - 1] == '"') { start++; nlen -= 2; }
+            if (nlen > 0) {
+                if (nlen >= out_sz) nlen = out_sz - 1;
+                memcpy(out, start, nlen);
+                out[nlen] = '\0';
+                return;
+            }
+        }
+    }
+
+    if (fallback && fallback[0]) {
+        strncpy(out, fallback, out_sz - 1);
+        out[out_sz - 1] = '\0';
+    }
+}
+
+static void truncate_utf8_text(const char *src, char *out, size_t out_sz, size_t max_bytes) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!src || !src[0]) return;
+
+    size_t limit = max_bytes;
+    if (limit > out_sz - 1) limit = out_sz - 1;
+    size_t len = strlen(src);
+    if (len <= limit) {
+        strncpy(out, src, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return;
+    }
+
+    // 不在 UTF-8 continuation byte 中间截断。
+    size_t cut = limit;
+    while (cut > 0 && (((unsigned char)src[cut] & 0xC0) == 0x80)) cut--;
+    if (cut == 0) cut = limit;
+    if (cut > out_sz - 4) cut = out_sz - 4;
+    memcpy(out, src, cut);
+    out[cut] = '\0';
+    strncat(out, "...", out_sz - strlen(out) - 1);
+}
+
+static void normalize_revoke_content(const char *orig_content, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!orig_content || !orig_content[0]) return;
+
+    struct { const char *needle; const char *replace; } kReplaces[] = {
+        {"发了一张图片", "图片"}, {"[图片]", "图片"}, {"<img", "图片"},
+        {"发了一段视频", "视频"}, {"[视频]", "视频"}, {"<videomsg", "视频"},
+        {"发了一个文件", "文件"}, {"[文件]", "文件"}, {"<appmsg", "文件"},
+        {"发了一段语音", "语音"}, {"发了一条语音消息", "语音"}, {"[语音]", "语音"}, {"<voicemsg", "语音"},
+        {"发了一个表情", "表情"}, {"[表情]", "表情"}, {"<emoji", "表情"},
+        {"发了一个视频号", "视频号"}, {"[视频号]", "视频号"},
+        {"发了一张名片", "名片"}, {"[名片]", "名片"},
+        {"发了一个位置", "位置"}, {"[位置]", "位置"}, {"<location", "位置"},
+        {"发了一个红包", "红包"}, {"[红包]", "红包"},
+        {"发了一个链接", "链接"}, {"[链接]", "链接"},
+        {"发了一个小程序", "小程序"}, {"[小程序]", "小程序"},
+        {NULL, NULL},
+    };
+    for (int i = 0; kReplaces[i].needle; i++) {
+        if (strstr(orig_content, kReplaces[i].needle)) {
+            strncpy(out, kReplaces[i].replace, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            return;
+        }
+    }
+
+    truncate_utf8_text(orig_content, out, out_sz, REVOKE_NOTICE_MAX_CHARS);
+}
+
+static void build_revoke_notice_text(const char *who, const char *orig_content,
+                                     _Bool has_orig, char *out, size_t out_sz) {
+    if (has_orig && orig_content && orig_content[0]) {
+        char normalized[256] = {0};
+        normalize_revoke_content(orig_content, normalized, sizeof(normalized));
+        snprintf(out, out_sz, "拦截到%s撤回了一条消息:%s", who, normalized[0] ? normalized : orig_content);
+    } else {
+        snprintf(out, out_sz, "拦截到%s撤回了一条消息", who);
+    }
+}
+
+static int zero_newmsgid_inplace(char *xml) {
+    if (!xml) return 0;
+    const char *start_ro = NULL, *end_ro = NULL;
+    if (!xml_find_tag_span(xml, "newmsgid", &start_ro, &end_ro)) return 0;
+    char *p = (char *)start_ro;
+    char *end = (char *)end_ro;
+    int dc = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        *p++ = '0';
+        dc++;
+    }
+    return dc;
+}
+
+// 保底路径：如果微信后续链路没有采用 msg+0x130 新指针，仍尽量在原 XML 里显示短提示。
+// 受原 CDATA 长度限制，所以只作为 fallback；完整提示依赖 rewrite_revoke_xml。
+static _Bool patch_cdata_inplace_truncated(char *xml, const char *notice_text) {
+    if (!xml || !notice_text || !notice_text[0]) return 0;
+    const char *start_ro = NULL, *end_ro = NULL;
+    if (!xml_find_cdata_span(xml, &start_ro, &end_ro)) return 0;
+    char *start = (char *)start_ro;
+    char *end = (char *)end_ro;
+    size_t span = (size_t)(end - start);
+    if (span == 0) return 0;
+
+    size_t n = strlen(notice_text);
+    if (n > span) n = span;
+    memcpy(start, notice_text, n);
+    if (n < span) memset(start + n, ' ', span - n);
+    return 1;
+}
+
+// 生成新的 XML：CDATA 换成完整自定义提示，newmsgid 置 0，避免原消息被删。
+// 返回 malloc 指针，调用者可写回 msg+0x130/0x138。
+static char *rewrite_revoke_xml(const char *xml, size_t xml_len,
+                                const char *notice_text, size_t *out_len) {
+    if (!xml || !notice_text || !notice_text[0] || !out_len) return NULL;
+    if (xml_len == 0 || xml_len >= REVOKE_XML_MAX_BYTES) return NULL;
+
+    const char *cd_start = NULL, *cd_end = NULL;
+    if (!xml_find_cdata_span(xml, &cd_start, &cd_end)) return NULL;
+
+    const char *nm_start = NULL, *nm_end = NULL;
+    _Bool has_nm = xml_find_tag_span(xml, "newmsgid", &nm_start, &nm_end);
+
+    char temp[REVOKE_XML_MAX_BYTES];
+    char *dst = temp;
+    size_t pos = 0;
+
+#define APPEND_BYTES(ptr, len) do { \
+        size_t _n = (size_t)(len); \
+        if (pos + _n >= REVOKE_XML_MAX_BYTES) return NULL; \
+        memcpy(dst + pos, (ptr), _n); \
+        pos += _n; \
+    } while (0)
+#define APPEND_CSTR(str) APPEND_BYTES((str), strlen(str))
+
+    // XML prefix + 新 CDATA
+    APPEND_BYTES(xml, (size_t)(cd_start - xml));
+    APPEND_CSTR(notice_text);
+
+    if (has_nm && nm_start > cd_end) {
+        // CDATA 结束到 newmsgid 值前
+        APPEND_BYTES(cd_end, (size_t)(nm_start - cd_end));
+        size_t digit_count = (size_t)(nm_end - nm_start);
+        if (digit_count == 0) digit_count = 1;
+        for (size_t i = 0; i < digit_count; i++) APPEND_CSTR("0");
+        APPEND_BYTES(nm_end, xml_len - (size_t)(nm_end - xml));
+    } else if (has_nm && nm_end <= cd_start) {
+        // 极少数 XML 中 newmsgid 在 CDATA 前：重新拼 prefix 时置零，再拼 CDATA。
+        pos = 0;
+        APPEND_BYTES(xml, (size_t)(nm_start - xml));
+        size_t digit_count = (size_t)(nm_end - nm_start);
+        if (digit_count == 0) digit_count = 1;
+        for (size_t i = 0; i < digit_count; i++) APPEND_CSTR("0");
+        APPEND_BYTES(nm_end, (size_t)(cd_start - nm_end));
+        APPEND_CSTR(notice_text);
+        APPEND_BYTES(cd_end, xml_len - (size_t)(cd_end - xml));
+    } else {
+        APPEND_BYTES(cd_end, xml_len - (size_t)(cd_end - xml));
+    }
+
+    if (pos >= REVOKE_XML_MAX_BYTES) return NULL;
+    dst[pos] = '\0';
+
+    char *heap_xml = (char *)malloc(pos + 1);
+    if (!heap_xml) return NULL;
+    memcpy(heap_xml, dst, pos + 1);
+    *out_len = pos;
+
+#undef APPEND_BYTES
+#undef APPEND_CSTR
+    return heap_xml;
+}
+
+// TSV 缓存追加（线程安全，原子 rename）
+static void append_tsv_cache(uint64_t svrid, const char *from, const char *content) {
+    if (svrid == 0 || !content || !content[0]) return;
+    // 去重：检查最后 5 行是否已有相同 svrid
+    FILE *chk = fopen("/tmp/wechat_msg_cache.tsv", "r");
+    if (chk) {
+        char line[1024];
+        int lines = 0;
+        while (fgets(line, sizeof(line), chk)) { lines++; }
+        fclose(chk);
+        // 简单扫描最后几行
+        chk = fopen("/tmp/wechat_msg_cache.tsv", "r");
+        if (chk) {
+            char last5[5][1024];
+            int idx = 0;
+            while (fgets(line, sizeof(line), chk)) {
+                memmove(last5[0], last5[1], sizeof(last5[1]));
+                memmove(last5[1], last5[2], sizeof(last5[2]));
+                memmove(last5[2], last5[3], sizeof(last5[3]));
+                memmove(last5[3], last5[4], sizeof(last5[4]));
+                strncpy(last5[4], line, sizeof(last5[4]) - 1);
+                last5[4][sizeof(last5[4]) - 1] = '\0';
+                if (++idx > 5) idx = 5;
+            }
+            fclose(chk);
+            for (int i = 0; i < idx; i++) {
+                char svrid_str[32];
+                snprintf(svrid_str, sizeof(svrid_str), "%llu\t", (unsigned long long)svrid);
+                if (strstr(last5[i], svrid_str)) return;  // 已存在
+            }
+        }
+    }
+
+    char line[1024];
+    // sanitize
+    char safe_from[64], safe_content[512];
+    { int j=0; for(int i=0; from[i] && j<62; i++) { unsigned char c=from[i]; safe_from[j++]=(c=='\t'||c=='\n')?' ':c; } safe_from[j]='\0'; }
+    { int j=0; for(int i=0; content[i] && j<510; i++) { unsigned char c=content[i]; safe_content[j++]=(c=='\t'||c=='\n')?' ':c; } safe_content[j]='\0'; }
+
+    int n = snprintf(line, sizeof(line), "%llu\t%s\t%s\n",
+        (unsigned long long)svrid, safe_from, safe_content);
+    if (n <= 0) return;
+
+    FILE *f = fopen("/tmp/wechat_msg_cache.tsv", "a");
+    if (f) {
+        fputs(line, f);
+        fclose(f);
+    }
+}
+
+// 信号保护的 ObjC 字符串读取：用 sigsetjmp/longjmp 安全探测未知指针
+static sigjmp_buf g_sig_jmpbuf;
+static struct sigaction g_sig_old_segv, g_sig_old_bus;
+static volatile sig_atomic_t g_sig_caught = 0;
+
+static void _sig_handler(int sig) {
+    g_sig_caught = 1;
+    siglongjmp(g_sig_jmpbuf, 1);
+}
+
+// 尝试通过 ObjC 消息提取 NSString 内容。返回 1=成功，out 中为 UTF-8 字符串
+static _Bool try_read_nsstring(uint64_t ptr, char *out, size_t out_sz) {
+    if (ptr < 0x100000000ULL || ptr > 0x20000000000ULL) return 0;
+
+    // 安装临时信号处理器
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = _sig_handler;
+    sigaction(SIGSEGV, &sa, &g_sig_old_segv);
+    sigaction(SIGBUS,  &sa, &g_sig_old_bus);
+
+    g_sig_caught = 0;
+    _Bool ok = 0;
+    if (sigsetjmp(g_sig_jmpbuf, 1) == 0) {
+        // — 受保护区域 —
+        @autoreleasepool {
+            id obj = (__bridge id)(void *)ptr;
+            if ([obj isKindOfClass:[NSString class]]) {
+                const char *utf8 = [(NSString *)obj UTF8String];
+                if (utf8 && utf8[0]) {
+                    strncpy(out, utf8, out_sz - 1);
+                    out[out_sz - 1] = '\0';
+                    ok = 1;
+                }
+            }
+        }
+    } else {
+        // SIGSEGV/SIGBUS 已发生，ptr 不是有效 ObjC 对象
+        ok = 0;
+    }
+
+    sigaction(SIGSEGV, &g_sig_old_segv, NULL);
+    sigaction(SIGBUS,  &g_sig_old_bus,  NULL);
+    return ok;
+}
+
+// 尝试将 content_ptr 当作 C 字符串读取（通过 mach_vm_read_overwrite，不会崩溃）
+static _Bool try_read_cstring(uint64_t ptr, char *out, size_t out_sz) {
+    if (ptr < 0x100000000ULL || ptr > 0x20000000000ULL) return 0;
+    mach_vm_size_t sz = (mach_vm_size_t)(out_sz - 1);
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+        (mach_vm_address_t)ptr, sz, (mach_vm_address_t)out, &sz);
+    if (kr != KERN_SUCCESS) return 0;
+    out[sz] = '\0';
+    // 检查是否像文本（可打印字符 / UTF-8）
+    int printable = 0;
+    for (size_t i = 0; out[i]; i++) {
+        unsigned char c = (unsigned char)out[i];
+        if (c >= 0x20 && c < 0x7F) { printable++; continue; }
+        if (c == '\n' || c == '\t' || c == '\r') continue;
+        if (c >= 0x80 && c <= 0xBF) continue;  // UTF-8 continuation byte
+        if (c >= 0xC0 && c <= 0xFD) continue;  // UTF-8 leading byte
+        // 不可打印，不是文本
+        return 0;
+    }
+    return printable >= 2;
+}
+
+// 从 content_ptr 提取字符串（先试 ObjC NSString，再试 C 字符串）
+static _Bool safe_extract_content(uint64_t content_ptr, char *out, size_t out_sz) {
+    if (try_read_nsstring(content_ptr, out, out_sz)) return 1;
+    if (try_read_cstring(content_ptr, out, out_sz)) return 1;
+    return 0;
+}
+
+// 从 CMessageWrap 提取 from_user wxid（通过 +0x08 wrapper）
+static void extract_from_user(uint64_t cmwrap, char *out, size_t out_sz) {
+    out[0] = '\0';
+    uint64_t fw = *(uint64_t *)((uint8_t *)cmwrap + 0x08);
+    if (fw < 0x100000000ULL || fw > 0x20000000000ULL) return;
+    uint64_t data_ptr = *(uint64_t *)((uint8_t *)fw + 0x08);
+    if (data_ptr < 0x100000000ULL || data_ptr > 0x20000000000ULL) return;
+    mach_vm_size_t sz = (mach_vm_size_t)(out_sz - 1);
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+        (mach_vm_address_t)data_ptr, sz, (mach_vm_address_t)out, &sz);
+    if (kr == KERN_SUCCESS) out[sz] = '\0';
+}
+
+// ── in-process 内容缓存按 svrid 查找 ──
+static _Bool lookup_ring_buffer(uint64_t svrid, char *out_content, size_t content_sz, char *out_from, size_t from_sz) {
+    out_content[0] = '\0';
+    out_from[0] = '\0';
+    int head = g_ring_head;
+    for (int i = 0; i < CONTENT_RING_SIZE; i++) {
+        int idx = (head - 1 - i + CONTENT_RING_SIZE * 2) % CONTENT_RING_SIZE;
+        if (g_content_ring[idx].svrid == svrid && g_content_ring[idx].content_ptr != 0) {
+            if (safe_extract_content(g_content_ring[idx].content_ptr, out_content, content_sz)) {
+                char from_buf[64] = {0};
+                extract_from_user(g_content_ring[idx].from_wrapper, from_buf, sizeof(from_buf));
+                if (from_buf[0]) strncpy(out_from, from_buf, from_sz - 1);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 
 
 // 已知 build 的硬编码地址（特征码搜索失败时的兜底）
 static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
-static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
+static const uintptr_t k4110_FuncVA_arm64  = 0x4602258;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
@@ -270,49 +774,49 @@ _Bool hook_isRevokeMessage(void *msg) {
     if (sender[0] == '\0') return 1;
     if (g_my_id[0] != '\0' && strncmp(sender, g_my_id, strlen(g_my_id)) == 0) return 1;
 
-    // 对方撤回 → 阻止
+    // 对方撤回
     ARLOG("拦截: %.20s", sender);
 
-    // 从 msg+0x130 (ptr) / +0x138 (len) 读撤回 XML
     char notify_text[256] = {0};
+    char orig_content[512] = {0};
+    _Bool has_orig = 0;
 
 #if defined(__arm64__) || defined(__aarch64__)
     uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
     uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
     if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        // CDATA 内容形如 "Macanzy" 撤回了一条消息
-        const char *xml_body = (const char *)xml_ptr;
-        const char *cs = strstr(xml_body, "<![CDATA[");
-        const char *ce = cs ? strstr(cs, "]]>") : NULL;
-        if (cs && ce) {
-            cs += 9;
-            size_t len = ce - cs;
-            if (len > 0 && len < sizeof(notify_text) - 1) {
-                memcpy(notify_text, cs, len);
-                notify_text[len] = '\0';
-            }
-        }
-    }
-#endif
+        char *xml = (char *)xml_ptr;
 
-    // 反查 lldb monitor 写入的消息缓存（/tmp/wechat_msg_cache.tsv）
-    char orig_content[512] = {0};
-    _Bool has_orig = 0;
-#if defined(__arm64__) || defined(__aarch64__)
-    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        const char *xml_body = (const char *)xml_ptr;
-        const char *p = strstr(xml_body, "<newmsgid>");
-        uint64_t newmsgid = 0;
-        if (p) {
-            p += 10;
-            int digits = 0;
-            while (*p >= '0' && *p <= '9' && digits < 20) {
-                newmsgid = newmsgid * 10 + (uint64_t)(*p - '0');
-                p++; digits++;
+        // 1. 读 CDATA → notify_text
+        {
+            const char *cs = strstr(xml, "<![CDATA[");
+            const char *ce = cs ? strstr(cs, "]]>") : NULL;
+            if (cs && ce) {
+                cs += 9;
+                size_t len = ce - cs;
+                if (len > 0 && len < sizeof(notify_text) - 1) {
+                    memcpy(notify_text, cs, len);
+                    notify_text[len] = '\0';
+                }
             }
-            if (digits == 0) newmsgid = 0;
         }
-        if (newmsgid != 0) {
+
+        // 2. 读 newmsgid（清空前先保存）
+        uint64_t newmsgid_val = 0;
+        {
+            const char *p = strstr(xml, "<newmsgid>");
+            if (p) {
+                p += 10;
+                int digits = 0;
+                while (*p >= '0' && *p <= '9' && digits < 20) {
+                    newmsgid_val = newmsgid_val * 10 + (uint64_t)(*p - '0');
+                    p++; digits++;
+                }
+            }
+        }
+
+        // 3. 反查 TSV 缓存
+        if (newmsgid_val != 0) {
             FILE *cf = fopen("/tmp/wechat_msg_cache.tsv", "r");
             if (cf) {
                 char line[1024];
@@ -324,7 +828,7 @@ _Bool hook_isRevokeMessage(void *msg) {
                     int d2 = 0;
                     for (const char *q = line; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
                         row_svrid = row_svrid * 10 + (uint64_t)(*q - '0');
-                    if (d2 == 0 || row_svrid != newmsgid) continue;
+                    if (d2 == 0 || row_svrid != newmsgid_val) continue;
                     char *t2 = strchr(t1 + 1, '\t');
                     if (!t2) continue;
                     char *nl = strchr(t2 + 1, '\n');
@@ -335,55 +839,70 @@ _Bool hook_isRevokeMessage(void *msg) {
                 fclose(cf);
             }
             ARLOG("撤回反查: svrid=%llu %s",
-                  (unsigned long long)newmsgid, has_orig ? "命中" : "未命中");
+                  (unsigned long long)newmsgid_val, has_orig ? "命中" : "未命中");
+        }
+
+        // 3b. 环缓冲反查（in-process 缓存，TSV 未命中时兜底）
+        if (!has_orig && newmsgid_val != 0) {
+            char rb_content[512] = {0};
+            char rb_from[64] = {0};
+            if (lookup_ring_buffer(newmsgid_val, rb_content, sizeof(rb_content),
+                                    rb_from, sizeof(rb_from))) {
+                strncpy(orig_content, rb_content, sizeof(orig_content) - 1);
+                has_orig = (orig_content[0] != '\0');
+                ARLOG("撤回反查(环缓冲): svrid=%llu 命中 -> %.60s",
+                      (unsigned long long)newmsgid_val, orig_content);
+            }
+        }
+
+        // 5. 方案B：生成完整自定义撤回 XML，并替换 msg 内 XML 指针/长度。
+        // 这样聊天窗口底部提示不再受原 CDATA 字节数限制；newmsgid 同时置零以保留原消息。
+        char who_for_xml[128] = {0};
+        extract_revoke_display_name(notify_text, sender, who_for_xml, sizeof(who_for_xml));
+        char notice_for_xml[1024] = {0};
+        build_revoke_notice_text(who_for_xml[0] ? who_for_xml : sender,
+                                 orig_content, has_orig,
+                                 notice_for_xml, sizeof(notice_for_xml));
+
+        // 先改原 XML：保底保证原消息不删；若新 XML 指针未被群聊链路采用，也能显示短提示。
+        int zeroed_digits = zero_newmsgid_inplace(xml);
+        _Bool patched_inplace = patch_cdata_inplace_truncated(xml, notice_for_xml);
+
+        size_t rewritten_len = 0;
+        char *rewritten_xml = rewrite_revoke_xml(xml, (size_t)xml_len,
+                                                 notice_for_xml, &rewritten_len);
+        if (rewritten_xml && rewritten_len > 0) {
+            *(uint64_t *)((uint8_t *)msg + 0x130) = (uint64_t)rewritten_xml;
+            *(uint64_t *)((uint8_t *)msg + 0x138) = (uint64_t)rewritten_len;
+            ARLOG("撤回XML已替换: old_len=%llu new_len=%llu zeroed=%d inplace=%d notify=%.120s text=%.120s",
+                  (unsigned long long)xml_len,
+                  (unsigned long long)rewritten_len,
+                  zeroed_digits,
+                  patched_inplace ? 1 : 0,
+                  notify_text,
+                  notice_for_xml);
+        } else {
+            ARLOG("撤回XML替换失败: zeroed=%d inplace=%d notify=%.120s text=%.120s",
+                  zeroed_digits,
+                  patched_inplace ? 1 : 0,
+                  notify_text,
+                  notice_for_xml);
         }
     }
 #endif
 
-    // 非文本消息描述模板 → 占位符
-    if (has_orig) {
-        struct { const char *needle; const char *replace; } kReplaces[] = {
-            {"发了一张图片", "[图片]"}, {"发了一段视频", "[视频]"},
-            {"发了一个文件", "[文件]"}, {"发了一段语音", "[语音]"},
-            {"发了一条语音消息", "[语音]"}, {"发了一个表情", "[表情]"},
-            {"发了一个视频号", "[视频号]"}, {"发了一张名片", "[名片]"},
-            {"发了一个位置", "[位置]"}, {"发了一个红包", "[红包]"},
-            {"发了一个链接", "[链接]"}, {"发了一个小程序", "[小程序]"},
-            {NULL, NULL},
-        };
-        for (int i = 0; kReplaces[i].needle; i++) {
-            if (strstr(orig_content, kReplaces[i].needle)) {
-                strncpy(orig_content, kReplaces[i].replace, sizeof(orig_content) - 1);
-                break;
-            }
-        }
-    }
-
-    // 从 notify_text 抽纯昵称：剥 "撤回了" 后缀 + 首尾空格 + 英文双引号
     char nick[128] = {0};
-    if (notify_text[0] != '\0') {
-        const char *p = strstr(notify_text, "撤回了");
-        if (p && p > notify_text) {
-            const char *start = notify_text;
-            size_t nlen = (size_t)(p - notify_text);
-            while (nlen > 0 && start[nlen - 1] == ' ') nlen--;
-            while (nlen > 0 && *start == ' ') { start++; nlen--; }
-            if (nlen >= 2 && start[0] == '"' && start[nlen - 1] == '"') { start++; nlen -= 2; }
-            if (nlen > 0 && nlen < sizeof(nick)) { memcpy(nick, start, nlen); nick[nlen] = '\0'; }
-        }
-    }
+    extract_revoke_display_name(notify_text, sender, nick, sizeof(nick));
     const char *who = (nick[0] != '\0') ? nick : sender;
 
-    char content[768] = {0};
-    if (has_orig) {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息：%s", who, orig_content);
-    } else {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息", who);
-    }
-
+    // macOS 通知与聊天窗口底部提示使用同一份文案。
+    char content[1024] = {0};
+    build_revoke_notice_text(who, orig_content, has_orig, content, sizeof(content));
     send_notification(content);
 
-    return 0;
+    // 返回 1 → 触发微信撤回通知显示在聊天窗口（XML 已改写 / newmsgid 已清零）
+    ARLOG("返回1触发撤回通知（XML已改写或newmsgid已清零）");
+    return 1;
 }
 
 // ── 查找 wechat.dylib 的 ASLR slide 和 mach_header ───────────
@@ -491,7 +1010,7 @@ static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_s
     return 0;
 }
 
-static const char *kKnownBuilds[] = { "268602", "268824", NULL };
+static const char *kKnownBuilds[] = { "268602", "268824", "269079", NULL };
 
 static _Bool is_known_build(const char *build) {
     if (!build) return 0;
@@ -568,6 +1087,151 @@ static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr)
     return 1;
 }
 
+// ── 内容拷贝 hook（in-process 缓存消息原文，供撤回反查）──
+// arm64 特征码：PREFIX(4insn)+GAP(1insn)+SUFFIX(1insn)
+//   PREFIX: stp x20,x19,[sp,#0x10]; stp x29,x30,[sp,#0x20];
+//           add x29,sp,#0x20; mov x19,x1
+//   GAP:    mov x20,x0
+//   SUFFIX: ldr x8, [x19, #0x70]
+static const uint32_t kContentCopy_Prefix[4] = {
+    0xF44FBEA9u, 0xFD7B01A9u, 0xFD430091u, 0xF30301AAu
+};
+static const uint32_t kContentCopy_Suffix[1] = { 0xF9403A68u };
+#define kContentCopy_GapBytes 4
+
+static uintptr_t g_content_copy_trampoline = 0;  // call-through trampoline 地址
+
+// 保存原函数头 20 字节 + 追加跳转，创建 call-through trampoline
+static _Bool install_callthrough_trampoline(uintptr_t func_addr, uintptr_t hook_addr,
+                                             uintptr_t *out_trampoline) {
+    static mach_vm_address_t s_tramp_page = 0;
+    static int s_tramp_offset = 0;
+
+    if (s_tramp_page == 0) {
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &s_tramp_page, 0x4000,
+                                             VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) {
+            ARLOG("ERROR: trampoline vm_allocate kr=%d", kr);
+            return 0;
+        }
+        kr = vm_protect(mach_task_self(), (vm_address_t)s_tramp_page, 0x4000, 0,
+                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            ARLOG("ERROR: trampoline vm_protect kr=%d", kr);
+            return 0;
+        }
+    }
+    if (s_tramp_offset + 64 > 0x4000) {
+        ARLOG("ERROR: trampoline page exhausted");
+        return 0;
+    }
+
+    uintptr_t tramp = (uintptr_t)(s_tramp_page + s_tramp_offset);
+    s_tramp_offset += 64;
+
+    // 复制原函数前 20 字节到 trampoline
+    memcpy((void *)tramp, (void *)func_addr, 20);
+
+    // 追加跳转到 func_addr+20
+    uint32_t *tp = (uint32_t *)(tramp + 20);
+    tp[0] = 0x58000050u;            // LDR X16, #8
+    tp[1] = 0xD61F0200u;            // BR X16
+    *(uint64_t *)(tramp + 28) = (uint64_t)(func_addr + 20);
+
+    sys_icache_invalidate((void *)tramp, 36);
+    *out_trampoline = tramp;
+    ARLOG("call-through trampoline @ 0x%lx -> orig+20 @ 0x%lx",
+          (unsigned long)tramp, (unsigned long)(func_addr + 20));
+
+    // 在 func_addr 安装 inline hook（覆盖前 20 字节）
+    return install_arm64_trampoline(func_addr, hook_addr);
+}
+
+// arm64 内容拷贝函数特征码搜索
+static uintptr_t scan_content_copy_arm64(uintptr_t text_start, size_t text_size) {
+    const uint32_t *base = (const uint32_t *)text_start;
+    size_t count = text_size / 4;
+    if (count < 6) return 0;
+
+    size_t gap_words = kContentCopy_GapBytes / 4; // 1 word
+
+    for (size_t i = 0; i + 4 + gap_words + 1 <= count; i++) {
+        if (base[i]   == kContentCopy_Prefix[0] &&
+            base[i+1] == kContentCopy_Prefix[1] &&
+            base[i+2] == kContentCopy_Prefix[2] &&
+            base[i+3] == kContentCopy_Prefix[3] &&
+            base[i+4+gap_words] == kContentCopy_Suffix[0]) {
+            // 返回 PREFIX 起始地址（即 pattern_addr）
+            return text_start + i * 4;
+        }
+    }
+    return 0;
+}
+
+// arm64 内容拷贝 inline hook
+// 被替换函数签名: void content_copy(void *msg, void *wrapper)
+// msg = CMessageWrap*,  msg+0x50=svrid, msg+0x08=from_wrapper
+// wrapper+0x70 = content 指针（会被复制到 msg+0x100）
+static void hook_on_content_copy(void *msg, void *wrapper) {
+    // 在调用原函数之前先保存关键数据
+    uint64_t svrid = msg ? *(uint64_t *)((uint8_t *)msg + 0x50) : 0;
+    uint64_t from_wrapper = msg ? (uint64_t)msg : 0;
+    uint64_t content_ptr = wrapper ? *(uint64_t *)((uint8_t *)wrapper + 0x70) : 0;
+
+    ARLOG("content_copy: msg=%p wrapper=%p svrid=%llu content_ptr=0x%llx",
+          msg, wrapper, (unsigned long long)svrid, (unsigned long long)content_ptr);
+
+    // 调用原函数（通过 call-through trampoline）
+    if (g_content_copy_trampoline) {
+        ((void (*)(void *, void *))g_content_copy_trampoline)(msg, wrapper);
+    }
+
+    // 存入环缓冲
+    if (svrid != 0 && content_ptr != 0) {
+        int idx = __sync_fetch_and_add((volatile int32_t *)&g_ring_head, 1);
+        idx = (idx % CONTENT_RING_SIZE + CONTENT_RING_SIZE) % CONTENT_RING_SIZE;
+        g_content_ring[idx].svrid = svrid;
+        g_content_ring[idx].content_ptr = content_ptr;
+        g_content_ring[idx].from_wrapper = from_wrapper;
+        g_content_ring[idx].saved_at = time(NULL);
+
+        // 同步写 TSV（尽力而为）
+        char content_buf[4096] = {0};
+        if (safe_extract_content(content_ptr, content_buf, sizeof(content_buf))) {
+            remember_emoji_xml_if_any(content_buf);
+            char from_buf[64] = {0};
+            extract_from_user(from_wrapper, from_buf, sizeof(from_buf));
+            append_tsv_cache(svrid, from_buf, content_buf);
+            ARLOG("content_copy: 缓存 %llu -> %.60s", (unsigned long long)svrid, content_buf);
+        } else {
+            ARLOG("content_copy: 内容提取失败 content_ptr=0x%llx", (unsigned long long)content_ptr);
+        }
+    }
+}
+
+// 安装内容拷贝 hook：特征码搜索 + trampoline 安装
+static void install_content_copy_hook(uintptr_t text_start, size_t text_size) {
+#if defined(__arm64__) || defined(__aarch64__)
+    uintptr_t pattern_addr = scan_content_copy_arm64(text_start, text_size);
+    if (pattern_addr == 0) {
+        ARLOG("content_copy: 特征码未找到");
+        return;
+    }
+
+    uintptr_t func_entry = pattern_addr - 4;  // 回退到 sub sp,sp 起始
+    uintptr_t hook_addr = (uintptr_t)&hook_on_content_copy;
+
+    if (install_callthrough_trampoline(func_entry, hook_addr, &g_content_copy_trampoline)) {
+        ARLOG("content_copy hook 安装成功: func=0x%lx pattern=0x%lx",
+              (unsigned long)func_entry, (unsigned long)pattern_addr);
+    } else {
+        ARLOG("ERROR: content_copy hook 安装失败");
+    }
+#else
+    ARLOG("content_copy: x86_64 暂未实现");
+#endif
+}
+
 static void notify_install_failed(const char *short_ver, const char *build, _Bool known_build) {
 
     char *cmd = (char *)malloc(2048);
@@ -606,6 +1270,1000 @@ static void notify_install_failed(const char *short_ver, const char *build, _Boo
     });
 }
 
+
+// ── 表情包菜单：导出所选表情包 / 复制表情包 ─────────────────────
+// 第一版走 AppKit 通用路径：让微信当前焦点控件执行 copy:，从 NSPasteboard
+// 读取 GIF/PNG/TIFF/文件 URL 数据。这样无需绑定微信私有消息模型；选中或右键
+// 表情后若微信本身能复制该表情，本功能即可导出/复制。
+static NSString *WCIStickerExportDir(void) {
+    NSString *home = NSHomeDirectory();
+    return [home stringByAppendingPathComponent:@"Downloads/WeChatStickers"];
+}
+
+static NSString *WCIStickerTimestamp(void) {
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    [fmt setDateFormat:@"yyyyMMdd-HHmmss-SSS"];
+    return [fmt stringFromDate:[NSDate date]];
+}
+
+static NSString *WCIExtForPasteboardType(NSPasteboardType type, NSData *data) {
+    if ([type isEqualToString:@"com.compuserve.gif"]) return @"gif";
+    if ([type isEqualToString:NSPasteboardTypePNG]) return @"png";
+    if ([type isEqualToString:NSPasteboardTypeTIFF]) return @"tiff";
+    if ([type isEqualToString:NSPasteboardTypeFileURL]) return @"file";
+    if (data.length >= 6) {
+        const unsigned char *b = data.bytes;
+        if (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)) return @"gif";
+    }
+    if (data.length >= 8) {
+        const unsigned char png[8] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+        if (!memcmp(data.bytes, png, 8)) return @"png";
+    }
+    if (data.length >= 12) {
+        const unsigned char *b = data.bytes;
+        if (!memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4)) return @"webp";
+    }
+    return @"bin";
+}
+
+static void WCINotifyUser(NSString *body) {
+    if (!body.length) return;
+    char buf[512] = {0};
+    strncpy(buf, body.UTF8String ?: "", sizeof(buf) - 1);
+    send_notification(buf);
+}
+
+static void WCINotifyStickerFailure(NSString *body) {
+    static CFTimeInterval lastNotify = 0;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - lastNotify < 2.0) {
+        ARLOG("sticker failure notification throttled: %s", body.UTF8String ?: "");
+        return;
+    }
+    lastNotify = now;
+    WCINotifyUser(body);
+}
+
+static void WCIPerformWechatCopy(void) {
+    // Do NOT call WeChat's targetForAction(copy:) directly. Some WeChat views assume
+    // a specific sender/event path and can crash when invoked from our injected menu.
+    // Send a normal Cmd+C key equivalent through AppKit; fall back to CGEvent.
+    @try {
+        NSWindow *win = [NSApp keyWindow] ?: [NSApp mainWindow];
+        NSTimeInterval ts = [NSDate timeIntervalSinceReferenceDate];
+        NSInteger windowNumber = win ? win.windowNumber : 0;
+        NSEvent *down = [NSEvent keyEventWithType:NSEventTypeKeyDown
+                                         location:NSZeroPoint
+                                    modifierFlags:NSEventModifierFlagCommand
+                                        timestamp:ts
+                                     windowNumber:windowNumber
+                                          context:nil
+                                       characters:@"c"
+                      charactersIgnoringModifiers:@"c"
+                                        isARepeat:NO
+                                          keyCode:8];
+        NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp
+                                       location:NSZeroPoint
+                                  modifierFlags:NSEventModifierFlagCommand
+                                      timestamp:ts + 0.01
+                                   windowNumber:windowNumber
+                                        context:nil
+                                     characters:@"c"
+                    charactersIgnoringModifiers:@"c"
+                                      isARepeat:NO
+                                        keyCode:8];
+        if (down && up) {
+            [NSApp sendEvent:down];
+            [NSApp sendEvent:up];
+            ARLOG("sticker copy: sent AppKit Cmd+C");
+            return;
+        }
+    } @catch (NSException *ex) {
+        ARLOG("sticker copy AppKit event exception: %s", ex.reason.UTF8String ?: "unknown");
+    }
+
+    CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)8, true);   // C
+    CGEventRef up   = CGEventCreateKeyboardEvent(src, (CGKeyCode)8, false);
+    if (down && up) {
+        CGEventSetFlags(down, kCGEventFlagMaskCommand);
+        CGEventSetFlags(up, kCGEventFlagMaskCommand);
+        CGEventPost(kCGHIDEventTap, down);
+        CGEventPost(kCGHIDEventTap, up);
+        ARLOG("sticker copy fallback: posted Cmd+C");
+    } else {
+        ARLOG("sticker copy fallback failed: cannot create CGEvent");
+    }
+    if (down) CFRelease(down);
+    if (up) CFRelease(up);
+    if (src) CFRelease(src);
+}
+
+static NSURL *WCIFileURLFromPasteboard(NSPasteboard *pb) {
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                             options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (urls.count > 0) return urls.firstObject;
+    NSString *s = [pb stringForType:NSPasteboardTypeFileURL];
+    if (s.length) return [NSURL URLWithString:s];
+    return nil;
+}
+
+static NSString *WCIExportStickerFromPasteboard(NSPasteboard *pb, NSString **outPath) {
+    if (outPath) *outPath = nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = WCIStickerExportDir();
+    NSError *err = nil;
+    if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
+        return [NSString stringWithFormat:@"创建目录失败: %@", err.localizedDescription ?: @"unknown"];
+    }
+
+    NSURL *fileURL = WCIFileURLFromPasteboard(pb);
+    if (fileURL.isFileURL && [fm fileExistsAtPath:fileURL.path]) {
+        NSString *ext = fileURL.path.pathExtension.length ? fileURL.path.pathExtension : @"dat";
+        NSString *dst = [dir stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"wechat-sticker-%@.%@", WCIStickerTimestamp(), ext]];
+        if ([fm copyItemAtPath:fileURL.path toPath:dst error:&err]) {
+            if (outPath) *outPath = dst;
+            return nil;
+        }
+        return [NSString stringWithFormat:@"复制缓存文件失败: %@", err.localizedDescription ?: @"unknown"];
+    }
+
+    NSArray<NSPasteboardType> *types = @[@"com.compuserve.gif", NSPasteboardTypePNG, NSPasteboardTypeTIFF];
+    for (NSPasteboardType type in types) {
+        NSData *data = [pb dataForType:type];
+        if (data.length == 0) continue;
+        NSString *ext = WCIExtForPasteboardType(type, data);
+        NSString *dst = [dir stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"wechat-sticker-%@.%@", WCIStickerTimestamp(), ext]];
+        if ([data writeToFile:dst options:NSDataWritingAtomic error:&err]) {
+            if (outPath) *outPath = dst;
+            return nil;
+        }
+        return [NSString stringWithFormat:@"写入文件失败: %@", err.localizedDescription ?: @"unknown"];
+    }
+
+    return @"未从当前选择中读到表情包数据。请先在聊天里选中/右键表情，或点开表情让微信加载后再试。";
+}
+
+static NSString *WCIExtForMediaData(NSData *data) {
+    if (data.length >= 6) {
+        const unsigned char *b = data.bytes;
+        if (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)) return @"gif";
+    }
+    if (data.length >= 12) {
+        const unsigned char *b = data.bytes;
+        if (!memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4)) return @"webp";
+    }
+    if (data.length >= 8) {
+        const unsigned char png[8] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+        if (!memcmp(data.bytes, png, 8)) return @"png";
+    }
+    if (data.length >= 3) {
+        const unsigned char *b = data.bytes;
+        if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return @"jpg";
+    }
+    return nil;
+}
+
+static NSData *WCIDownloadURLString(NSString *urlString) {
+    if (!urlString.length) return nil;
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) return nil;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:15.0];
+    [req setValue:@"Mozilla/5.0 WeChatIntercept" forHTTPHeaderField:@"User-Agent"];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSData *data = nil;
+    __block NSInteger status = 0;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) status = [(NSHTTPURLResponse *)resp statusCode];
+        if (!err && (!status || (status >= 200 && status < 300))) data = d;
+        dispatch_semaphore_signal(sem);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC)));
+    if (data.length > 0) ARLOG("sticker download ok: status=%ld bytes=%lu", (long)status, (unsigned long)data.length);
+    else ARLOG("sticker download failed: status=%ld url=%s", (long)status, urlString.UTF8String ?: "");
+    return data;
+}
+
+static NSString *WCIExportEmojiXMLToFile(NSString *xmlString, NSString **outPath) {
+    if (outPath) *outPath = nil;
+    if (!xmlString.length) return @"还没有捕获到表情 XML。请先右键目标表情并点击 Select...，再导出最近捕获表情包。";
+    const char *xml = xmlString.UTF8String;
+    char md5[128] = {0}, cdnurl[2048] = {0}, externurl[2048] = {0}, encrypturl[2048] = {0};
+    xml_find_attr_value(xml, "md5", md5, sizeof(md5));
+    xml_find_attr_value(xml, "cdnurl", cdnurl, sizeof(cdnurl));
+    xml_find_attr_value(xml, "externurl", externurl, sizeof(externurl));
+    xml_find_attr_value(xml, "encrypturl", encrypturl, sizeof(encrypturl));
+
+    NSArray<NSString *> *urls = @[
+        [NSString stringWithUTF8String:cdnurl[0] ? cdnurl : ""],
+        [NSString stringWithUTF8String:externurl[0] ? externurl : ""],
+        [NSString stringWithUTF8String:encrypturl[0] ? encrypturl : ""]
+    ];
+
+    NSData *media = nil;
+    NSString *ext = nil;
+    for (NSString *url in urls) {
+        if (!url.length) continue;
+        NSData *d = WCIDownloadURLString(url);
+        NSString *e = WCIExtForMediaData(d);
+        if (d.length > 0 && e.length) { media = d; ext = e; break; }
+        // encrypturl may need AES; do not export encrypted bytes as a fake GIF.
+    }
+    if (!media.length || !ext.length) {
+        return @"已捕获表情 XML，但下载到的数据不是 GIF/WebP/PNG；该表情可能使用 encrypturl+aeskey 加密，当前版本不会伪装保存加密文件。";
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = WCIStickerExportDir();
+    NSError *err = nil;
+    if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
+        return [NSString stringWithFormat:@"创建目录失败: %@", err.localizedDescription ?: @"unknown"];
+    }
+    NSString *base = md5[0] ? [NSString stringWithUTF8String:md5] : [NSString stringWithFormat:@"wechat-sticker-%@", WCIStickerTimestamp()];
+    NSString *dst = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", base, ext]];
+    if (![media writeToFile:dst options:NSDataWritingAtomic error:&err]) {
+        return [NSString stringWithFormat:@"写入表情包失败: %@", err.localizedDescription ?: @"unknown"];
+    }
+    if (outPath) *outPath = dst;
+    return nil;
+}
+
+static NSString *WCIExportLastEmojiXMLToFile(NSString **outPath) {
+    NSString *xml = nil;
+    if (g_last_emoji_xml[0]) xml = [NSString stringWithUTF8String:g_last_emoji_xml];
+    if (!xml.length) {
+        // Fallback: read last row from disk cache written by content hook / previous sessions.
+        NSString *cache = @"/tmp/wechat_emoji_xml_cache.tsv";
+        NSString *body = [NSString stringWithContentsOfFile:cache encoding:NSUTF8StringEncoding error:nil];
+        NSArray<NSString *> *lines = [body componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+        for (NSString *line in [lines reverseObjectEnumerator]) {
+            if (!line.length) continue;
+            NSArray<NSString *> *parts = [line componentsSeparatedByString:@"\t"];
+            if (parts.count >= 3) { xml = parts[2]; break; }
+        }
+    }
+    return WCIExportEmojiXMLToFile(xml, outPath);
+}
+
+static void WCIAutoExportLastEmojiForSaveAction(void) {
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - g_wciLastAutoExportAt < 1.5) {
+        ARLOG("sticker auto export skipped: throttled");
+        return;
+    }
+    g_wciLastAutoExportAt = now;
+    g_wciSuppressSaveAlertUntil = now + 20.0;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *path = nil;
+        NSString *err = WCIExportLastEmojiXMLToFile(&path);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (err) {
+                ARLOG("sticker save auto export failed: %s", err.UTF8String ?: "unknown");
+                // Keep suppressing WeChat's unsupported-type prompt; our notification is clearer.
+                g_wciSuppressSaveAlertUntil = CFAbsoluteTimeGetCurrent() + 12.0;
+                WCINotifyStickerFailure(err);
+                return;
+            }
+            ARLOG("sticker save auto exported: %s", path.UTF8String ?: "");
+            g_wciSuppressSaveAlertUntil = CFAbsoluteTimeGetCurrent() + 12.0;
+            WCINotifyUser([NSString stringWithFormat:@"表情包已导出: %@", path.lastPathComponent]);
+            if (path.length) [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+        });
+    });
+}
+
+static BOOL WCIStringLooksLikeEmojiXML(NSString *s) {
+    if (!s.length) return NO;
+    return ([s rangeOfString:@"<emoji"].location != NSNotFound ||
+            [s rangeOfString:@"cdnurl"].location != NSNotFound ||
+            [s rangeOfString:@"encrypturl"].location != NSNotFound);
+}
+
+static BOOL WCIHarvestEmojiXMLString(NSString *s, const char *source) {
+    if (!WCIStringLooksLikeEmojiXML(s)) return NO;
+    const char *utf8 = s.UTF8String;
+    if (!utf8) return NO;
+    remember_emoji_xml_if_any(utf8);
+    ARLOG("emoji xml harvested from %s len=%lu", source ? source : "object", (unsigned long)s.length);
+    return YES;
+}
+
+static BOOL WCIHarvestEmojiXMLFromObject(id obj, int depth, int *budget) {
+    if (!obj || depth > 4 || !budget || *budget <= 0) return NO;
+    (*budget)--;
+
+    @try {
+        if ([obj isKindOfClass:[NSString class]]) {
+            return WCIHarvestEmojiXMLString((NSString *)obj, "NSString");
+        }
+        if ([obj isKindOfClass:[NSData class]]) {
+            NSString *s = [[NSString alloc] initWithData:(NSData *)obj encoding:NSUTF8StringEncoding];
+            if (WCIHarvestEmojiXMLString(s, "NSData")) return YES;
+        }
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            __block BOOL found = NO;
+            [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id key, id val, BOOL *stop) {
+                if (WCIHarvestEmojiXMLFromObject(key, depth + 1, budget) ||
+                    WCIHarvestEmojiXMLFromObject(val, depth + 1, budget)) { found = YES; *stop = YES; }
+            }];
+            if (found) return YES;
+        }
+        if ([obj isKindOfClass:[NSArray class]] || [obj isKindOfClass:[NSSet class]]) {
+            for (id val in obj) {
+                if (WCIHarvestEmojiXMLFromObject(val, depth + 1, budget)) return YES;
+                if (*budget <= 0) break;
+            }
+        }
+        if ([obj respondsToSelector:@selector(stringValue)]) {
+            id v = nil;
+            @try { v = [obj performSelector:@selector(stringValue)]; } @catch (__unused NSException *e) {}
+            if ([v isKindOfClass:[NSString class]] && WCIHarvestEmojiXMLString(v, "stringValue")) return YES;
+        }
+        if ([obj respondsToSelector:@selector(title)]) {
+            id v = nil;
+            @try { v = [obj performSelector:@selector(title)]; } @catch (__unused NSException *e) {}
+            if ([v isKindOfClass:[NSString class]] && WCIHarvestEmojiXMLString(v, "title")) return YES;
+        }
+
+        Class cls = object_getClass(obj);
+        for (int c = 0; cls && c < 4; c++, cls = class_getSuperclass(cls)) {
+            unsigned int count = 0;
+            Ivar *ivars = class_copyIvarList(cls, &count);
+            if (!ivars) continue;
+            for (unsigned int i = 0; i < count; i++) {
+                const char *type = ivar_getTypeEncoding(ivars[i]);
+                if (!type || type[0] != '@') continue;
+                id val = nil;
+                @try { val = object_getIvar(obj, ivars[i]); } @catch (__unused NSException *e) { val = nil; }
+                if (val && WCIHarvestEmojiXMLFromObject(val, depth + 1, budget)) {
+                    free(ivars);
+                    return YES;
+                }
+                if (*budget <= 0) break;
+            }
+            free(ivars);
+            if (*budget <= 0) break;
+        }
+    } @catch (NSException *ex) {
+        ARLOG("emoji harvest exception: %s", ex.reason.UTF8String ?: "unknown");
+    }
+    return NO;
+}
+
+static void WCITryHarvestFromAction(id target, id sender, SEL action) {
+    NSString *title = nil;
+    @try {
+        if ([sender respondsToSelector:@selector(title)]) title = [sender performSelector:@selector(title)];
+    } @catch (__unused NSException *e) {}
+    NSString *actionName = action ? NSStringFromSelector(action) : @"";
+    const char *targetClass = target ? class_getName([target class]) : "nil";
+    ARLOG("action observed: title=%s action=%s target=%s sender=%s",
+          title.UTF8String ?: "", actionName.UTF8String ?: "", targetClass,
+          sender ? class_getName([sender class]) : "nil");
+
+    BOOL isSave = ([title rangeOfString:@"Save"].location != NSNotFound ||
+                   [title rangeOfString:@"保存"].location != NSNotFound ||
+                   [actionName rangeOfString:@"save" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    BOOL interesting = (!title.length || isSave ||
+                        [title rangeOfString:@"Select"].location != NSNotFound ||
+                        [title rangeOfString:@"选择"].location != NSNotFound ||
+                        [title rangeOfString:@"Forward"].location != NSNotFound ||
+                        [title rangeOfString:@"Add Sticker"].location != NSNotFound ||
+                        [actionName rangeOfString:@"select" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [actionName rangeOfString:@"emoji" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    if (!interesting) return;
+    int budget = isSave ? 600 : 220;
+    BOOL found = WCIHarvestEmojiXMLFromObject(sender, 0, &budget);
+    if (!found) {
+        budget = isSave ? 800 : 260;
+        found = WCIHarvestEmojiXMLFromObject(target, 0, &budget);
+    }
+    if (isSave) {
+        g_wciSuppressSaveAlertUntil = CFAbsoluteTimeGetCurrent() + 20.0;
+        ARLOG("save action sticker harvest: found=%d last_md5=%s suppress_until=%.1f", found ? 1 : 0, g_last_emoji_md5, g_wciSuppressSaveAlertUntil);
+        if (found || g_last_emoji_xml[0]) {
+            WCIAutoExportLastEmojiForSaveAction();
+        } else {
+            WCINotifyStickerFailure(@"未从选中消息中捕获到表情 XML，已拦截微信原保存限制提示。请发日志继续定位选中消息模型。");
+        }
+    }
+}
+
+@interface NSApplication (WCIStickerActionHook)
+- (BOOL)wci_sendAction:(SEL)action to:(id)target from:(id)sender;
+@end
+@implementation NSApplication (WCIStickerActionHook)
+- (BOOL)wci_sendAction:(SEL)action to:(id)target from:(id)sender {
+    WCITryHarvestFromAction(target, sender, action);
+    return [self wci_sendAction:action to:target from:sender];
+}
+@end
+
+@interface NSControl (WCIStickerActionHook)
+- (BOOL)wci_sendAction:(SEL)action to:(id)target;
+@end
+@implementation NSControl (WCIStickerActionHook)
+- (BOOL)wci_sendAction:(SEL)action to:(id)target {
+    WCITryHarvestFromAction(target, self, action);
+    return [self wci_sendAction:action to:target];
+}
+@end
+
+
+static BOOL WCITextLooksLikeUnsupportedSave(NSString *text) {
+    if (!text.length) return NO;
+    return ([text rangeOfString:@"Only viewable images/videos/ files can be saved"].location != NSNotFound ||
+            [text rangeOfString:@"Other message types will not be saved"].location != NSNotFound ||
+            [text rangeOfString:@"viewable images/videos"].location != NSNotFound ||
+            [text rangeOfString:@"Other message types"].location != NSNotFound);
+}
+
+static NSString *WCICollectTextFromView(NSView *view, int depth, int *budget) {
+    if (!view || depth > 6 || !budget || *budget <= 0) return @"";
+    (*budget)--;
+    NSMutableString *out = [NSMutableString string];
+    @try {
+        if ([view respondsToSelector:@selector(stringValue)]) {
+            id v = [(id)view performSelector:@selector(stringValue)];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) [out appendFormat:@" %@", v];
+        }
+        if ([view respondsToSelector:@selector(title)]) {
+            id v = [(id)view performSelector:@selector(title)];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) [out appendFormat:@" %@", v];
+        }
+        for (NSView *sub in view.subviews) {
+            NSString *s = WCICollectTextFromView(sub, depth + 1, budget);
+            if (s.length) [out appendString:s];
+            if (*budget <= 0) break;
+        }
+    } @catch (__unused NSException *e) {}
+    return out;
+}
+
+static BOOL WCIWindowLooksLikeUnsupportedSave(NSWindow *window) {
+    if (!window) return NO;
+    int budget = 180;
+    NSString *text = WCICollectTextFromView(window.contentView, 0, &budget);
+    BOOL hit = WCITextLooksLikeUnsupportedSave(text);
+    if (hit) ARLOG("unsupported-save window matched: %s", text.UTF8String ?: "");
+    return hit;
+}
+
+static BOOL WCIAlertLooksLikeUnsupportedSave(NSAlert *alert) {
+    NSString *text = @"";
+    @try {
+        text = [NSString stringWithFormat:@"%@ %@", alert.messageText ?: @"", alert.informativeText ?: @""];
+    } @catch (__unused NSException *e) { return NO; }
+    return WCITextLooksLikeUnsupportedSave(text);
+}
+
+@interface NSAlert (WCIStickerSaveAlertHook)
+- (NSModalResponse)wci_runModal;
+- (void)wci_beginSheetModalForWindow:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler;
+@end
+@implementation NSAlert (WCIStickerSaveAlertHook)
+- (NSModalResponse)wci_runModal {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIAlertLooksLikeUnsupportedSave(self)) {
+        ARLOG("suppressed WeChat unsupported-save alert(runModal)");
+        return NSAlertFirstButtonReturn;
+    }
+    return [self wci_runModal];
+}
+- (void)wci_beginSheetModalForWindow:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIAlertLooksLikeUnsupportedSave(self)) {
+        ARLOG("suppressed WeChat unsupported-save alert(sheet)");
+        if (handler) handler(NSAlertFirstButtonReturn);
+        return;
+    }
+    [self wci_beginSheetModalForWindow:sheetWindow completionHandler:handler];
+}
+@end
+
+
+@interface NSApplication (WCIStickerSaveModalHook)
+- (NSInteger)wci_runModalForWindow:(NSWindow *)window;
+- (void)wci_beginSheet:(NSWindow *)sheet modalForWindow:(NSWindow *)docWindow modalDelegate:(id)modalDelegate didEndSelector:(SEL)didEndSelector contextInfo:(void *)contextInfo;
+@end
+@implementation NSApplication (WCIStickerSaveModalHook)
+- (NSInteger)wci_runModalForWindow:(NSWindow *)window {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(window)) {
+        ARLOG("suppressed WeChat unsupported-save window(runModalForWindow)");
+        [window close];
+        return NSModalResponseOK;
+    }
+    return [self wci_runModalForWindow:window];
+}
+- (void)wci_beginSheet:(NSWindow *)sheet modalForWindow:(NSWindow *)docWindow modalDelegate:(id)modalDelegate didEndSelector:(SEL)didEndSelector contextInfo:(void *)contextInfo {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(sheet)) {
+        ARLOG("suppressed WeChat unsupported-save window(beginSheet legacy)");
+        [sheet close];
+        return;
+    }
+    [self wci_beginSheet:sheet modalForWindow:docWindow modalDelegate:modalDelegate didEndSelector:didEndSelector contextInfo:contextInfo];
+}
+@end
+
+@interface NSWindow (WCIStickerSaveSheetHook)
+- (void)wci_beginSheet:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler;
+- (void)wci_beginCriticalSheet:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler;
+- (void)wci_orderFront:(id)sender;
+- (void)wci_makeKeyAndOrderFront:(id)sender;
+@end
+@implementation NSWindow (WCIStickerSaveSheetHook)
+- (void)wci_beginSheet:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(sheetWindow)) {
+        ARLOG("suppressed WeChat unsupported-save window(beginSheet)");
+        [sheetWindow close];
+        if (handler) handler(NSModalResponseOK);
+        return;
+    }
+    [self wci_beginSheet:sheetWindow completionHandler:handler];
+}
+- (void)wci_beginCriticalSheet:(NSWindow *)sheetWindow completionHandler:(void (^)(NSModalResponse returnCode))handler {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(sheetWindow)) {
+        ARLOG("suppressed WeChat unsupported-save window(beginCriticalSheet)");
+        [sheetWindow close];
+        if (handler) handler(NSModalResponseOK);
+        return;
+    }
+    [self wci_beginCriticalSheet:sheetWindow completionHandler:handler];
+}
+- (void)wci_orderFront:(id)sender {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(self)) {
+        ARLOG("suppressed WeChat unsupported-save window(orderFront)");
+        [self close];
+        return;
+    }
+    [self wci_orderFront:sender];
+}
+- (void)wci_makeKeyAndOrderFront:(id)sender {
+    if (CFAbsoluteTimeGetCurrent() < g_wciSuppressSaveAlertUntil && WCIWindowLooksLikeUnsupportedSave(self)) {
+        ARLOG("suppressed WeChat unsupported-save window(makeKeyAndOrderFront)");
+        [self close];
+        return;
+    }
+    [self wci_makeKeyAndOrderFront:sender];
+}
+@end
+
+@interface WCIStickerMenuHandler : NSObject
++ (instancetype)shared;
+- (void)exportSelectedSticker:(id)sender;
+- (void)copySelectedSticker:(id)sender;
+- (void)exportPasteboardSticker:(id)sender;
+- (void)copyPasteboardSticker:(id)sender;
+- (void)exportLastCapturedSticker:(id)sender;
+- (void)openStickerExportDir:(id)sender;
+@end
+
+@implementation WCIStickerMenuHandler
++ (instancetype)shared {
+    static WCIStickerMenuHandler *handler = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ handler = [WCIStickerMenuHandler new]; });
+    return handler;
+}
+
+- (void)exportSelectedSticker:(id)sender {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSInteger before = pb.changeCount;
+        WCIPerformWechatCopy();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (pb.changeCount == before) {
+                NSString *msg = @"微信未更新剪贴板。请先选中/右键表情，或点开表情让微信加载后再试。";
+                ARLOG("sticker export skipped: pasteboard unchanged");
+                WCINotifyStickerFailure(msg);
+                return;
+            }
+            NSString *path = nil;
+            NSString *err = WCIExportStickerFromPasteboard(pb, &path);
+            if (err) {
+                ARLOG("sticker export failed: %s", err.UTF8String ?: "unknown");
+                WCINotifyStickerFailure(err);
+                return;
+            }
+            ARLOG("sticker exported: %s", path.UTF8String ?: "");
+            WCINotifyUser([NSString stringWithFormat:@"表情包已导出: %@", path.lastPathComponent]);
+            if (path.length) {
+                [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+            }
+        });
+    });
+}
+
+- (void)copySelectedSticker:(id)sender {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSInteger before = pb.changeCount;
+        WCIPerformWechatCopy();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (pb.changeCount == before) {
+                NSString *msg = @"微信未更新剪贴板。请先选中/右键表情，或点开表情让微信加载后再试。";
+                ARLOG("sticker copy skipped: pasteboard unchanged");
+                WCINotifyStickerFailure(msg);
+                return;
+            }
+            BOOL hasSticker = ([pb dataForType:@"com.compuserve.gif"].length > 0 ||
+                               [pb dataForType:NSPasteboardTypePNG].length > 0 ||
+                               [pb dataForType:NSPasteboardTypeTIFF].length > 0 ||
+                               WCIFileURLFromPasteboard(pb) != nil);
+            if (hasSticker) {
+                ARLOG("sticker copied to pasteboard");
+                WCINotifyUser(@"表情包已复制到剪贴板");
+            } else {
+                NSString *msg = @"未复制到表情包数据。请先选中/右键表情，或点开表情让微信加载后再试。";
+                ARLOG("sticker copy produced no supported pasteboard data");
+                WCINotifyStickerFailure(msg);
+            }
+        });
+    });
+}
+
+- (void)exportPasteboardSticker:(id)sender {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSString *path = nil;
+        NSString *err = WCIExportStickerFromPasteboard(pb, &path);
+        if (err) {
+            ARLOG("sticker pasteboard export failed: %s", err.UTF8String ?: "unknown");
+            WCINotifyStickerFailure(err);
+            return;
+        }
+        ARLOG("sticker pasteboard exported: %s", path.UTF8String ?: "");
+        WCINotifyUser([NSString stringWithFormat:@"剪贴板表情包已导出: %@", path.lastPathComponent]);
+        if (path.length) {
+            [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+        }
+    });
+}
+
+- (void)copyPasteboardSticker:(id)sender {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        BOOL hasSticker = ([pb dataForType:@"com.compuserve.gif"].length > 0 ||
+                           [pb dataForType:NSPasteboardTypePNG].length > 0 ||
+                           [pb dataForType:NSPasteboardTypeTIFF].length > 0 ||
+                           WCIFileURLFromPasteboard(pb) != nil);
+        if (hasSticker) {
+            ARLOG("sticker pasteboard already contains sticker data");
+            WCINotifyUser(@"剪贴板已有表情包数据，可直接粘贴");
+        } else {
+            NSString *msg = @"当前剪贴板没有可识别的表情包数据。请先右键目标表情并点击 Select...，再导出最近捕获表情包。";
+            ARLOG("sticker pasteboard has no supported data");
+            WCINotifyStickerFailure(msg);
+        }
+    });
+}
+
+- (void)exportLastCapturedSticker:(id)sender {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *path = nil;
+        NSString *err = WCIExportLastEmojiXMLToFile(&path);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (err) {
+                ARLOG("sticker original export failed: %s", err.UTF8String ?: "unknown");
+                WCINotifyStickerFailure(err);
+                return;
+            }
+            ARLOG("sticker original exported: %s", path.UTF8String ?: "");
+            WCINotifyUser([NSString stringWithFormat:@"表情包已导出: %@", path.lastPathComponent]);
+            if (path.length) [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+        });
+    });
+}
+
+- (void)openStickerExportDir:(id)sender {
+    NSString *dir = WCIStickerExportDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir]];
+}
+@end
+
+
+static BOOL WCIContextMenuAlreadyInstalled(NSMenu *menu) {
+    for (NSMenuItem *item in menu.itemArray) {
+        if ([item.representedObject isEqual:@"WCIStickerContextItem"]) return YES;
+    }
+    return NO;
+}
+
+static NSInteger WCIStickerInsertIndex(NSMenu *menu) {
+    NSInteger idx = menu.numberOfItems;
+    for (NSInteger i = 0; i < menu.numberOfItems; i++) {
+        NSString *title = [menu itemAtIndex:i].title ?: @"";
+        if ([title isEqualToString:@"Delete"] || [title isEqualToString:@"删除"]) {
+            idx = i;
+            break;
+        }
+    }
+    return idx;
+}
+
+static void WCIAddStickerItemsToMenu(NSMenu *menu) {
+    if (!menu || WCIContextMenuAlreadyInstalled(menu)) return;
+    WCIStickerMenuHandler *handler = [WCIStickerMenuHandler shared];
+    NSInteger idx = WCIStickerInsertIndex(menu);
+
+    NSMenuItem *sep1 = [NSMenuItem separatorItem];
+    sep1.representedObject = @"WCIStickerContextItem";
+    [menu insertItem:sep1 atIndex:idx++];
+
+    NSMenuItem *exportItem = [[NSMenuItem alloc] initWithTitle:@"导出所选表情包"
+                                                        action:@selector(exportSelectedSticker:)
+                                                 keyEquivalent:@""];
+    exportItem.target = handler;
+    exportItem.representedObject = @"WCIStickerContextItem";
+    [menu insertItem:exportItem atIndex:idx++];
+
+    NSMenuItem *copyItem = [[NSMenuItem alloc] initWithTitle:@"复制表情包"
+                                                      action:@selector(copySelectedSticker:)
+                                               keyEquivalent:@""];
+    copyItem.target = handler;
+    copyItem.representedObject = @"WCIStickerContextItem";
+    [menu insertItem:copyItem atIndex:idx++];
+}
+
+
+static BOOL WCIShouldPatchContextMenu(NSMenu *menu) {
+    if (!menu || WCIContextMenuAlreadyInstalled(menu)) return NO;
+    if (menu == [NSApp mainMenu]) return NO;
+    BOOL looksLikeMessageMenu = NO;
+    for (NSMenuItem *item in menu.itemArray) {
+        NSString *title = item.title ?: @"";
+        if ([title isEqualToString:@"Add Sticker"] ||
+            [title isEqualToString:@"添加到表情"] ||
+            [title hasPrefix:@"Forward"] ||
+            [title hasPrefix:@"转发"] ||
+            [title hasPrefix:@"Select"] ||
+            [title hasPrefix:@"选择"] ||
+            [title isEqualToString:@"Quote"] ||
+            [title isEqualToString:@"引用"] ||
+            [title isEqualToString:@"Delete"] ||
+            [title isEqualToString:@"删除"]) {
+            looksLikeMessageMenu = YES;
+            break;
+        }
+    }
+    return looksLikeMessageMenu;
+}
+
+static void WCIAddStickerItemsToContextMenu(NSMenu *menu) {
+    if (!WCIShouldPatchContextMenu(menu)) return;
+    WCIAddStickerItemsToMenu(menu);
+}
+
+static BOOL WCIIsBuildingMenuHook = NO;
+
+@interface NSMenu (WCIStickerMenuBuildHook)
+- (void)wci_addItem:(NSMenuItem *)newItem;
+- (void)wci_insertItem:(NSMenuItem *)newItem atIndex:(NSInteger)index;
+@end
+
+@implementation NSMenu (WCIStickerMenuBuildHook)
+- (void)wci_addItem:(NSMenuItem *)newItem {
+    [self wci_addItem:newItem];
+    if (!WCIIsBuildingMenuHook && WCIShouldPatchContextMenu(self)) {
+        WCIIsBuildingMenuHook = YES;
+        WCIAddStickerItemsToMenu(self);
+        ARLOG("sticker context menu patched(addItem): %ld items", (long)self.numberOfItems);
+        WCIIsBuildingMenuHook = NO;
+    }
+}
+
+- (void)wci_insertItem:(NSMenuItem *)newItem atIndex:(NSInteger)index {
+    [self wci_insertItem:newItem atIndex:index];
+    if (!WCIIsBuildingMenuHook && WCIShouldPatchContextMenu(self)) {
+        WCIIsBuildingMenuHook = YES;
+        WCIAddStickerItemsToMenu(self);
+        ARLOG("sticker context menu patched(insertItem): %ld items", (long)self.numberOfItems);
+        WCIIsBuildingMenuHook = NO;
+    }
+}
+@end
+
+@interface NSMenu (WCIStickerContextMenu)
+- (BOOL)wci_popUpMenuPositioningItem:(NSMenuItem *)item atLocation:(NSPoint)location inView:(NSView *)view;
++ (void)wci_popUpContextMenu:(NSMenu *)menu withEvent:(NSEvent *)event forView:(NSView *)view;
++ (void)wci_popUpContextMenu:(NSMenu *)menu withEvent:(NSEvent *)event forView:(NSView *)view withFont:(NSFont *)font;
+@end
+
+@implementation NSMenu (WCIStickerContextMenu)
+- (BOOL)wci_popUpMenuPositioningItem:(NSMenuItem *)item atLocation:(NSPoint)location inView:(NSView *)view {
+    WCIAddStickerItemsToContextMenu(self);
+    ARLOG("sticker context menu popup(instance): %ld items", (long)self.numberOfItems);
+    return [self wci_popUpMenuPositioningItem:item atLocation:location inView:view];
+}
+
++ (void)wci_popUpContextMenu:(NSMenu *)menu withEvent:(NSEvent *)event forView:(NSView *)view {
+    WCIAddStickerItemsToContextMenu(menu);
+    ARLOG("sticker context menu popup(class): %ld items", (long)menu.numberOfItems);
+    [self wci_popUpContextMenu:menu withEvent:event forView:view];
+}
+
++ (void)wci_popUpContextMenu:(NSMenu *)menu withEvent:(NSEvent *)event forView:(NSView *)view withFont:(NSFont *)font {
+    WCIAddStickerItemsToContextMenu(menu);
+    ARLOG("sticker context menu popup(class+font): %ld items", (long)menu.numberOfItems);
+    [self wci_popUpContextMenu:menu withEvent:event forView:view withFont:font];
+}
+@end
+
+@interface NSView (WCIStickerContextMenu)
+- (NSMenu *)wci_menuForEvent:(NSEvent *)event;
+@end
+
+@implementation NSView (WCIStickerContextMenu)
+- (NSMenu *)wci_menuForEvent:(NSEvent *)event {
+    NSMenu *menu = [self wci_menuForEvent:event];
+    if (menu) {
+        WCIAddStickerItemsToContextMenu(menu);
+        ARLOG("sticker context menu menuForEvent: view=%s items=%ld", class_getName([self class]), (long)menu.numberOfItems);
+    }
+    return menu;
+}
+@end
+
+static void WCISwizzleInstanceMethod(Class cls, SEL origSel, SEL replSel, const char *name) {
+    Method orig = class_getInstanceMethod(cls, origSel);
+    Method repl = class_getInstanceMethod(cls, replSel);
+    if (orig && repl) {
+        method_exchangeImplementations(orig, repl);
+        ARLOG("sticker context hook installed: %s", name);
+    } else {
+        ARLOG("sticker context hook unavailable: %s", name);
+    }
+}
+
+static void WCISwizzleClassMethod(Class cls, SEL origSel, SEL replSel, const char *name) {
+    Class meta = object_getClass(cls);
+    Method orig = class_getClassMethod(cls, origSel);
+    Method repl = class_getClassMethod(cls, replSel);
+    if (meta && orig && repl) {
+        method_exchangeImplementations(orig, repl);
+        ARLOG("sticker context hook installed: %s", name);
+    } else {
+        ARLOG("sticker context hook unavailable: %s", name);
+    }
+}
+
+static void WCIInstallContextMenuHook(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        WCISwizzleInstanceMethod([NSMenu class],
+                                 @selector(popUpMenuPositioningItem:atLocation:inView:),
+                                 @selector(wci_popUpMenuPositioningItem:atLocation:inView:),
+                                 "NSMenu -popUpMenuPositioningItem");
+        WCISwizzleClassMethod([NSMenu class],
+                              @selector(popUpContextMenu:withEvent:forView:),
+                              @selector(wci_popUpContextMenu:withEvent:forView:),
+                              "NSMenu +popUpContextMenu");
+        WCISwizzleClassMethod([NSMenu class],
+                              @selector(popUpContextMenu:withEvent:forView:withFont:),
+                              @selector(wci_popUpContextMenu:withEvent:forView:withFont:),
+                              "NSMenu +popUpContextMenuWithFont");
+        WCISwizzleInstanceMethod([NSView class],
+                                 @selector(menuForEvent:),
+                                 @selector(wci_menuForEvent:),
+                                 "NSView -menuForEvent");
+        WCISwizzleInstanceMethod([NSMenu class],
+                                 @selector(addItem:),
+                                 @selector(wci_addItem:),
+                                 "NSMenu -addItem");
+        WCISwizzleInstanceMethod([NSMenu class],
+                                 @selector(insertItem:atIndex:),
+                                 @selector(wci_insertItem:atIndex:),
+                                 "NSMenu -insertItem");
+        WCISwizzleInstanceMethod([NSApplication class],
+                                 @selector(sendAction:to:from:),
+                                 @selector(wci_sendAction:to:from:),
+                                 "NSApplication -sendAction");
+        WCISwizzleInstanceMethod([NSControl class],
+                                 @selector(sendAction:to:),
+                                 @selector(wci_sendAction:to:),
+                                 "NSControl -sendAction");
+        WCISwizzleInstanceMethod([NSAlert class],
+                                 @selector(runModal),
+                                 @selector(wci_runModal),
+                                 "NSAlert -runModal");
+        WCISwizzleInstanceMethod([NSAlert class],
+                                 @selector(beginSheetModalForWindow:completionHandler:),
+                                 @selector(wci_beginSheetModalForWindow:completionHandler:),
+                                 "NSAlert -beginSheet");
+        WCISwizzleInstanceMethod([NSApplication class],
+                                 @selector(runModalForWindow:),
+                                 @selector(wci_runModalForWindow:),
+                                 "NSApplication -runModalForWindow");
+        WCISwizzleInstanceMethod([NSApplication class],
+                                 @selector(beginSheet:modalForWindow:modalDelegate:didEndSelector:contextInfo:),
+                                 @selector(wci_beginSheet:modalForWindow:modalDelegate:didEndSelector:contextInfo:),
+                                 "NSApplication -beginSheetLegacy");
+        WCISwizzleInstanceMethod([NSWindow class],
+                                 @selector(beginSheet:completionHandler:),
+                                 @selector(wci_beginSheet:completionHandler:),
+                                 "NSWindow -beginSheet");
+        WCISwizzleInstanceMethod([NSWindow class],
+                                 @selector(beginCriticalSheet:completionHandler:),
+                                 @selector(wci_beginCriticalSheet:completionHandler:),
+                                 "NSWindow -beginCriticalSheet");
+        WCISwizzleInstanceMethod([NSWindow class],
+                                 @selector(orderFront:),
+                                 @selector(wci_orderFront:),
+                                 "NSWindow -orderFront");
+        WCISwizzleInstanceMethod([NSWindow class],
+                                 @selector(makeKeyAndOrderFront:),
+                                 @selector(wci_makeKeyAndOrderFront:),
+                                 "NSWindow -makeKeyAndOrderFront");
+    });
+}
+
+static void WCIInstallStickerMenu(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMenu *mainMenu = [NSApp mainMenu];
+        if (!mainMenu) {
+            ARLOG("sticker menu: mainMenu not ready");
+            return;
+        }
+        for (NSMenuItem *item in mainMenu.itemArray) {
+            if ([item.title isEqualToString:@"WeChatIntercept"]) {
+                WCIInstallContextMenuHook();
+                return;
+            }
+        }
+        WCIStickerMenuHandler *handler = [WCIStickerMenuHandler shared];
+        NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"WeChatIntercept" action:nil keyEquivalent:@""];
+        NSMenu *submenu = [[NSMenu alloc] initWithTitle:@"WeChatIntercept"];
+
+        NSMenuItem *exportItem = [[NSMenuItem alloc] initWithTitle:@"导出所选表情包"
+                                                            action:@selector(exportSelectedSticker:)
+                                                     keyEquivalent:@"e"];
+        exportItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+        exportItem.target = handler;
+        [submenu addItem:exportItem];
+
+        NSMenuItem *copyItem = [[NSMenuItem alloc] initWithTitle:@"复制表情包"
+                                                          action:@selector(copySelectedSticker:)
+                                                   keyEquivalent:@"c"];
+        copyItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+        copyItem.target = handler;
+        [submenu addItem:copyItem];
+
+        [submenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *exportPbItem = [[NSMenuItem alloc] initWithTitle:@"导出剪贴板表情包"
+                                                              action:@selector(exportPasteboardSticker:)
+                                                       keyEquivalent:@""];
+        exportPbItem.target = handler;
+        [submenu addItem:exportPbItem];
+
+        NSMenuItem *copyPbItem = [[NSMenuItem alloc] initWithTitle:@"检查剪贴板表情包"
+                                                            action:@selector(copyPasteboardSticker:)
+                                                     keyEquivalent:@""];
+        copyPbItem.target = handler;
+        [submenu addItem:copyPbItem];
+
+        [submenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *exportLastItem = [[NSMenuItem alloc] initWithTitle:@"导出最近捕获表情包"
+                                                                 action:@selector(exportLastCapturedSticker:)
+                                                          keyEquivalent:@""];
+        exportLastItem.target = handler;
+        [submenu addItem:exportLastItem];
+
+        [submenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *openItem = [[NSMenuItem alloc] initWithTitle:@"打开表情包导出目录"
+                                                          action:@selector(openStickerExportDir:)
+                                                   keyEquivalent:@""];
+        openItem.target = handler;
+        [submenu addItem:openItem];
+
+        root.submenu = submenu;
+        [mainMenu addItem:root];
+        WCIInstallContextMenuHook();
+        ARLOG("sticker menu installed");
+    });
+}
+
 // ── 主 constructor ───────────────────────────────────────────
 __attribute__((constructor))
 static void hook_init(void) {
@@ -615,6 +2273,7 @@ static void hook_init(void) {
 
         log_open();
         ARLOG("hook_init 启动");
+        WCIInstallStickerMenu();
 
         char short_ver[32] = {0};
         char build[32] = {0};
@@ -713,6 +2372,13 @@ static void hook_init(void) {
         }
 #endif
 
+        // 安装内容拷贝 hook（不依赖 isRevokeMessage 安装结果）
+        if (has_text) {
+            install_content_copy_hook(text_start, text_size);
+        } else {
+            ARLOG("content_copy: __TEXT 未找到，跳过");
+        }
+
         if (!installed) {
             ARLOG("ERROR: hook 安装失败 - 微信版本 %s (build %s) 未适配",
                   short_ver, build);
@@ -724,7 +2390,7 @@ static void hook_init(void) {
 }
 HOOK_SOURCE
 
-    clang -arch arm64 -arch x86_64 -shared -framework Foundation \
+    clang -arch arm64 -arch x86_64 -shared -framework Foundation -framework AppKit -framework ApplicationServices \
         -o "$DYLIB_DST" \
         -install_name "$DYLIB_INSTALL_NAME" \
         "$SRC_FILE" 2>&1
